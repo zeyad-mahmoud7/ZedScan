@@ -1,0 +1,16 @@
+# ─── Python dependencies ────────────────────────────────────────────
+Flask>=2.3.0
+python-nmap>=0.7.1
+httpx>=0.25.0
+dnspython>=2.4.0
+
+# ─── External tools (install separately) ────────────────────────────
+# nmap       → https://nmap.org/download         (port scanning & MS17-010 check)
+# gobuster   → https://github.com/OJ/gobuster    (directory & DNS scanning)
+#
+# Linux / Kali:
+#   sudo apt install nmap gobuster
+#
+# Windows:
+#   nmap:     https://nmap.org/dist/nmap-7.95-setup.exe
+#   gobuster: https://github.com/OJ/gobuster/releases  → add extracted folder to PATH
