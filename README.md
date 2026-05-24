@@ -117,6 +117,11 @@ You can also provide a custom wordlist path directly in the UI.
 
 ---
 
+## Disclaimer
+
+**This tool is intended for authorized penetration testing and educational purposes only. Only use it against systems you have explicit permission to test.**
+
+
 ## Author
 
 **Zeyad Mahmoud** — [github.com/zeyad-mahmoud7](https://github.com/zeyad-mahmoud7)
