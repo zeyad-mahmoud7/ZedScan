@@ -69,6 +69,12 @@ _BUILTIN_SUBDOMAIN_CANDIDATES = [
 HTTP_TIMEOUT     = 8.0
 GOBUSTER_TIMEOUT = 300
 
+# Ports probed concurrently when no explicit port is given in the target URL.
+# Ordered by real-world frequency so the first open hit is usually the right one.
+_HTTP_PROBE_PORTS:  list = [80, 8080, 8000, 8008, 8888, 8081, 3000, 9000, 9080, 5000]
+_HTTPS_PROBE_PORTS: list = [443, 8443, 4443]
+_HTTPS_PORT_SET:    set  = set(_HTTPS_PROBE_PORTS)
+
 # Browser UA so WAFs / CDNs don't filter gobuster's default user-agent string
 _GOBUSTER_UA = (
     'Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0'
@@ -252,6 +258,85 @@ def friendly_error(exc: Exception, context: str = 'Operation') -> str:
     if any(k in msg for k in ('ssl', 'certificate', 'handshake')):
         return f'{context}: SSL/TLS negotiation failed — certificate may be invalid.'
     return f'{context}: Unexpected error — target may be unreachable or protected.'
+
+
+# ── HTTP port discovery ───────────────────────────────────────────────────────
+
+def _find_http_port(host: str, target: str) -> tuple:
+    """
+    Return (scheme, port) to use for web-based scanning (gobuster dir / vhost).
+
+    Resolution order
+    ────────────────
+    1. Explicit port written in the target string
+         http://host:8080  →  ('http', 8080)
+         https://host:8443 →  ('https', 8443)
+         host:8080         →  ('http', 8080)
+    2. Concurrent TCP probe of common HTTP/HTTPS ports.
+         First port that accepts a connection wins.
+         Port ≥443-class → 'https', otherwise 'http'.
+    3. Hard fallback: ('http', 80).
+    """
+    t = target.strip()
+
+    # ── 1. Explicit port in URL ──────────────────────────────────────────
+    for pfx, pfx_scheme in (('https://', 'https'), ('http://', 'http')):
+        if t.lower().startswith(pfx):
+            netloc = t[len(pfx):].split('/')[0].split('?')[0]
+            if ':' in netloc and not netloc.startswith('['):   # skip IPv6
+                try:
+                    port = int(netloc.rsplit(':', 1)[1])
+                    logger.info('HTTP scan: explicit port from URL → %s:%d', pfx_scheme, port)
+                    return pfx_scheme, port
+                except ValueError:
+                    pass
+            # Scheme present but no port → fall through to probe
+            break
+
+    # bare  host:PORT  (no scheme prefix)
+    if ':' in t and '://' not in t and not t.startswith('['):
+        parts = t.rsplit(':', 1)
+        if parts[1].isdigit():
+            port   = int(parts[1])
+            scheme = 'https' if port in _HTTPS_PORT_SET else 'http'
+            logger.info('HTTP scan: bare host:port → %s:%d', scheme, port)
+            return scheme, port
+
+    # ── 2. Concurrent TCP probe ──────────────────────────────────────────
+    # Reorder based on scheme hint so the most-likely port is checked first
+    tl = t.lower()
+    if tl.startswith('https://'):
+        probe_order = [443, 8443, 4443] + [p for p in _HTTP_PROBE_PORTS]
+    elif tl.startswith('http://'):
+        probe_order = _HTTP_PROBE_PORTS + [443, 8443]
+    else:
+        probe_order = [80, 8080, 443, 8443] + [
+            p for p in _HTTP_PROBE_PORTS if p not in (80, 8080)
+        ] + [p for p in _HTTPS_PROBE_PORTS if p not in (443, 8443)]
+
+    def _tcp_open(port: int) -> bool:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.5)
+            ok = s.connect_ex((host, port)) == 0
+            s.close()
+            return ok
+        except Exception:
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(probe_order), 12)) as ex:
+        results = dict(zip(probe_order, ex.map(_tcp_open, probe_order)))
+
+    for p in probe_order:
+        if results.get(p):
+            scheme = 'https' if p in _HTTPS_PORT_SET else 'http'
+            logger.info('HTTP port probe: selected %s:%d for %s', scheme, p, host)
+            return scheme, p
+
+    # ── 3. Fallback ──────────────────────────────────────────────────────
+    logger.info('HTTP port probe: nothing open on %s — defaulting to http:80', host)
+    return 'http', 80
 
 
 # ── OS detection from nmap -sV service banners ────────────────────────────────
@@ -620,15 +705,22 @@ def scan_nmap(sess: dict) -> bool:
         return False
 
 
-def resolve_gobuster_url(scheme: str, host: str) -> tuple:
+def resolve_gobuster_url(scheme: str, host: str, port: int = 0) -> tuple:
     """
     Follow HTTP redirects to resolve the real scan base URL before launching
     gobuster, so the scanner always targets the correct final hostname.
 
+    port=0 means 'use the scheme default (80/443)'.
+    Non-default ports are written explicitly into the URL (e.g. http://host:8080).
+
     Returns (final_url: str, reachable: bool).
     reachable=False means a connection-refused error — no web server present.
     """
-    base = f'{scheme}://{host}'
+    default_port = 443 if scheme == 'https' else 80
+    if port and port != default_port:
+        base = f'{scheme}://{host}:{port}'
+    else:
+        base = f'{scheme}://{host}'
     try:
         with httpx.Client(timeout=HTTP_TIMEOUT, verify=False,
                           follow_redirects=True) as c:
@@ -647,12 +739,16 @@ def scan_gobuster(sess: dict) -> None:
     target = sess['target']
     sess['tool_status']['gobuster'] = 'running'
     emit(sess, {'type': 'tool_status', 'tool': 'gobuster', 'status': 'running',
-                'msg': 'Directory brute-force running...'})
+                'msg': 'Detecting HTTP port...'})
 
-    host   = extract_hostname(target)
-    scheme = 'https' if target.startswith('https://') else 'http'
+    host          = extract_hostname(target)
+    scheme, port  = _find_http_port(host, target)
 
-    base_url, reachable = resolve_gobuster_url(scheme, host)
+    port_display  = f':{port}' if port not in (80, 443) else ''
+    emit(sess, {'type': 'tool_status', 'tool': 'gobuster', 'status': 'running',
+                'msg': f'Directory brute-force on {scheme}://{host}{port_display}...'})
+
+    base_url, reachable = resolve_gobuster_url(scheme, host, port)
     if not reachable:
         sess['tool_status']['gobuster'] = 'error'
         emit(sess, {'type': 'tool_status', 'tool': 'gobuster', 'status': 'error',
@@ -839,31 +935,25 @@ def _vhost_baseline_size(base_url: str, domain: str) -> int | None:
         return None
 
 
-def _scan_subdomains_vhost(sess: dict, domain: str, base_ip: str, wordlist: str) -> int:
+def _scan_subdomains_vhost(sess: dict, domain: str, base_ip: str, wordlist: str,
+                            http_scheme: str = 'http', http_port: int = 80) -> int:
     """
     Virtual host enumeration via gobuster vhost.
     Sends HTTP requests with Host: <candidate>.<domain> headers.
     Works for private / CTF / HackTheBox targets that rely on /etc/hosts.
+
+    http_scheme / http_port are determined by _find_http_port() before this
+    function is called, so we already know which port the web server listens on.
+
     Returns count found, or -1 if gobuster is unavailable.
     """
-    # ── 1. Determine reachable scheme (http first, then https) ───────────
-    base_url = None
-    for scheme in ('http', 'https'):
-        url = f'{scheme}://{domain}'
-        try:
-            with httpx.Client(timeout=8, verify=False, follow_redirects=True) as c:
-                c.head(url)
-            base_url = url
-            logger.info('Vhost scan: %s is reachable', url)
-            break
-        except Exception as probe_exc:
-            logger.info('Vhost scan: %s not reachable (%s)', url, probe_exc)
-
-    if not base_url:
-        logger.info('Vhost scan: %s unreachable via HTTP and HTTPS — skipping', domain)
-        emit(sess, {'type': 'tool_status', 'tool': 'subdomain', 'status': 'running',
-                    'msg': f'{domain} not reachable — cannot run vhost scan'})
-        return 0
+    # ── 1. Build base URL with the correct port ───────────────────────────
+    default_port = 443 if http_scheme == 'https' else 80
+    if http_port != default_port:
+        base_url = f'{http_scheme}://{domain}:{http_port}'
+    else:
+        base_url = f'{http_scheme}://{domain}'
+    logger.info('Vhost scan: base URL → %s', base_url)
 
     # ── 2. Baseline probe — measure "not found" response size ────────────
     baseline_size = _vhost_baseline_size(base_url, domain)
@@ -1036,7 +1126,7 @@ def scan_subdomains(sess: dict) -> None:
                         'proceeding with vhost enumeration', host, resolved_hostname)
             emit(sess, {'type': 'tool_status', 'tool': 'subdomain', 'status': 'running',
                         'msg': f'Reverse lookup: {host} → {resolved_hostname}. '
-                               f'Virtual host enumeration running...'})
+                               f'Detecting HTTP port...'})
             host = resolved_hostname
         else:
             # No hostname mapping — nothing to enumerate
@@ -1056,10 +1146,15 @@ def scan_subdomains(sess: dict) -> None:
         # Private / CTF target — use virtual host enumeration (HTTP Host header fuzzing)
         logger.info('Subdomain: %s resolves to private IP %s → vhost mode',
                     base_domain, resolved_ip)
+        # Detect the actual HTTP port before launching gobuster vhost
+        vhost_scheme, vhost_port = _find_http_port(base_domain, target)
+        logger.info('Subdomain: vhost will use %s:%d for %s', vhost_scheme, vhost_port, base_domain)
+        port_display = f':{vhost_port}' if vhost_port not in (80, 443) else ''
         emit(sess, {'type': 'tool_status', 'tool': 'subdomain', 'status': 'running',
-                    'msg': 'Virtual host enumeration running...'})
+                    'msg': f'Virtual host enumeration on {vhost_scheme}://{base_domain}{port_display}...'})
         if dns_wordlist:
-            found = _scan_subdomains_vhost(sess, base_domain, resolved_ip, dns_wordlist)
+            found = _scan_subdomains_vhost(sess, base_domain, resolved_ip, dns_wordlist,
+                                            http_scheme=vhost_scheme, http_port=vhost_port)
             if found == -1:
                 found = _scan_subdomains_builtin(sess, base_domain)
         else:
